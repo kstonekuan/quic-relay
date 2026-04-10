@@ -8,11 +8,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// Registration prefix: peers send `REG:<session_uuid>\n` to join a session.
-const REG_PREFIX: &[u8] = b"REG:";
-/// Acknowledgement sent back after successful registration.
-const ACK_RESPONSE: &[u8] = b"ACK\n";
-
 #[derive(Parser)]
 #[command(
     name = "quic-relay",
@@ -26,6 +21,56 @@ struct Args {
     /// Seconds of inactivity before a session is cleaned up.
     #[arg(long, default_value_t = 300)]
     session_timeout_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Protocol: parsed message types at the UDP boundary
+// ---------------------------------------------------------------------------
+
+/// A parsed incoming UDP message. Produced once at the boundary; downstream
+/// code works with typed variants instead of raw bytes.
+enum RelayMessage<'a> {
+    /// Peer registration: `REG:<session_id>\n`
+    Registration { session_id: SessionId },
+    /// Opaque datagram to be forwarded to the other peer in the session.
+    Data { payload: &'a [u8] },
+}
+
+const REG_PREFIX: &[u8] = b"REG:";
+const ACK_RESPONSE: &[u8] = b"ACK\n";
+
+impl<'a> RelayMessage<'a> {
+    /// Parse raw UDP packet into a typed message at the system boundary.
+    fn parse(packet: &'a [u8]) -> Result<Self, &'static str> {
+        if packet.starts_with(REG_PREFIX) {
+            let payload = &packet[REG_PREFIX.len()..];
+            let raw = std::str::from_utf8(payload).map_err(|_| "invalid UTF-8 in registration")?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("empty session ID");
+            }
+            Ok(Self::Registration {
+                session_id: SessionId(trimmed.to_string()),
+            })
+        } else {
+            Ok(Self::Data { payload: packet })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
+
+/// Opaque session identifier. Parsed from registration packets; prevents
+/// accidental use of arbitrary strings as session keys.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionId(String);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 /// Outcome of attempting to register a peer in a session.
@@ -44,6 +89,8 @@ struct Session {
     peers: [Option<SocketAddr>; 2],
     /// Last time any datagram was forwarded or a registration occurred.
     last_active: Instant,
+    /// Number of datagrams forwarded in this session.
+    forwarded_count: u64,
 }
 
 impl Session {
@@ -51,6 +98,15 @@ impl Session {
         Self {
             peers: [Some(first_peer), None],
             last_active: Instant::now(),
+            forwarded_count: 0,
+        }
+    }
+
+    /// Returns both peer addresses if the session is fully paired.
+    fn paired_peers(&self) -> Option<(SocketAddr, SocketAddr)> {
+        match (self.peers[0], self.peers[1]) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
         }
     }
 
@@ -80,10 +136,15 @@ impl Session {
     }
 }
 
-type SessionMap = Arc<Mutex<HashMap<String, Session>>>;
+// The session ID is stored as both a key in SessionMap and a value in PeerIndex.
+// This duplication is intentional: the reverse index enables O(1) lookup on
+// every data packet (the hot path) without scanning all sessions.
+type SessionMap = Arc<Mutex<HashMap<SessionId, Session>>>;
+type PeerIndex = Arc<Mutex<HashMap<SocketAddr, SessionId>>>;
 
-/// Reverse index: peer address → session ID for fast lookup on data packets.
-type PeerIndex = Arc<Mutex<HashMap<SocketAddr, String>>>;
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
 
 fn spawn_cleanup_task(sessions: SessionMap, peer_index: PeerIndex, session_timeout: Duration) {
     tokio::spawn(async move {
@@ -99,7 +160,10 @@ fn spawn_cleanup_task(sessions: SessionMap, peer_index: PeerIndex, session_timeo
                     for addr in session.peers.iter().flatten() {
                         peer_index_guard.remove(addr);
                     }
-                    info!("Cleaned up stale session {session_id}");
+                    info!(
+                        "Cleaned up stale session {session_id} ({} datagrams forwarded)",
+                        session.forwarded_count
+                    );
                 }
                 alive
             });
@@ -119,19 +183,8 @@ async fn handle_registration(
     sessions: &SessionMap,
     peer_index: &PeerIndex,
     src_addr: SocketAddr,
-    payload: &[u8],
+    session_id: SessionId,
 ) {
-    let Ok(raw_session_id) = std::str::from_utf8(payload) else {
-        warn!("Invalid UTF-8 in registration from {src_addr}");
-        return;
-    };
-
-    let session_id = raw_session_id.trim().to_string();
-    if session_id.is_empty() {
-        warn!("Empty session ID from {src_addr}");
-        return;
-    }
-
     let mut sessions_guard = sessions.lock().await;
     let mut peer_index_guard = peer_index.lock().await;
 
@@ -143,6 +196,9 @@ async fn handle_registration(
     match session.register(src_addr) {
         RegistrationResult::NewPeer => {
             info!("Peer {src_addr} joined session {session_id}");
+            if let Some((peer_a, peer_b)) = session.paired_peers() {
+                info!("Session {session_id} active: {peer_a} <-> {peer_b}");
+            }
         }
         RegistrationResult::AlreadyRegistered => {
             debug!("Peer {src_addr} re-registered for session {session_id}");
@@ -182,8 +238,19 @@ async fn handle_data_forward(
     };
 
     session.last_active = Instant::now();
+    session.forwarded_count += 1;
+    let count = session.forwarded_count;
 
     if let Some(dest_addr) = session.other_peer(src_addr) {
+        // Log first forward and then every 100th to avoid spam.
+        if count == 1 {
+            info!(
+                "Session {session_id}: first datagram forwarded ({} bytes, {src_addr} -> {dest_addr})",
+                packet.len()
+            );
+        } else if count % 100 == 0 {
+            info!("Session {session_id}: {count} datagrams forwarded");
+        }
         drop(sessions_guard);
         if let Err(error) = socket.send_to(packet, dest_addr).await {
             warn!("Failed to forward to {dest_addr}: {error}");
@@ -192,6 +259,10 @@ async fn handle_data_forward(
         debug!("No peer to forward to for session {session_id} from {src_addr}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -219,13 +290,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; 65536];
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
-        let packet = &buf[..len];
 
-        if packet.starts_with(REG_PREFIX) {
-            let payload = &packet[REG_PREFIX.len()..];
-            handle_registration(&socket, &sessions, &peer_index, src_addr, payload).await;
-        } else {
-            handle_data_forward(&socket, &sessions, &peer_index, src_addr, packet).await;
+        match RelayMessage::parse(&buf[..len]) {
+            Ok(RelayMessage::Registration { session_id }) => {
+                handle_registration(&socket, &sessions, &peer_index, src_addr, session_id).await;
+            }
+            Ok(RelayMessage::Data { payload }) => {
+                handle_data_forward(&socket, &sessions, &peer_index, src_addr, payload).await;
+            }
+            Err(reason) => {
+                warn!("Bad packet from {src_addr}: {reason}");
+            }
         }
     }
 }
