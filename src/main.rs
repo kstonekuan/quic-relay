@@ -134,6 +134,26 @@ impl Session {
             None
         }
     }
+
+    /// Find a peer whose IP matches but port differs (NAT port rebinding).
+    /// Returns the peer slot index if found, so the caller can update it.
+    fn find_peer_by_ip(&self, addr: SocketAddr) -> Option<usize> {
+        for (i, peer) in self.peers.iter().enumerate() {
+            if let Some(peer_addr) = peer {
+                if peer_addr.ip() == addr.ip() && peer_addr.port() != addr.port() {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Update a peer's address (e.g. after NAT port rebinding).
+    fn update_peer_addr(&mut self, slot: usize, new_addr: SocketAddr) -> SocketAddr {
+        let old_addr = self.peers[slot].unwrap();
+        self.peers[slot] = Some(new_addr);
+        old_addr
+    }
 }
 
 // The session ID is stored as both a key in SessionMap and a value in PeerIndex.
@@ -224,12 +244,40 @@ async fn handle_data_forward(
     src_addr: SocketAddr,
     packet: &[u8],
 ) {
-    let peer_index_guard = peer_index.lock().await;
-    let Some(session_id) = peer_index_guard.get(&src_addr).cloned() else {
-        debug!("Data from unregistered peer {src_addr}, dropping");
-        return;
+    // Look up session by exact address first.
+    let mut peer_index_guard = peer_index.lock().await;
+    let session_id = if let Some(id) = peer_index_guard.get(&src_addr).cloned() {
+        id
+    } else {
+        // NAT port rebinding: the peer's port changed (e.g. keepalive socket closed,
+        // Quinn bound the same local port but NAT assigned a different external port).
+        // Search all sessions for a peer with matching IP.
+        drop(peer_index_guard);
+        let mut sessions_guard = sessions.lock().await;
+        let mut found = None;
+        for (session_id, session) in sessions_guard.iter_mut() {
+            if let Some(slot) = session.find_peer_by_ip(src_addr) {
+                let old_addr = session.update_peer_addr(slot, src_addr);
+                info!(
+                    "Session {session_id}: peer port rebind {old_addr} -> {src_addr} (NAT changed)"
+                );
+                found = Some(session_id.clone());
+                break;
+            }
+        }
+        drop(sessions_guard);
+
+        let Some(session_id) = found else {
+            debug!("Data from unregistered peer {src_addr}, dropping");
+            return;
+        };
+
+        // Update peer index with new address.
+        peer_index_guard = peer_index.lock().await;
+        peer_index_guard.insert(src_addr, session_id.clone());
+        drop(peer_index_guard);
+        session_id
     };
-    drop(peer_index_guard);
 
     let mut sessions_guard = sessions.lock().await;
     let Some(session) = sessions_guard.get_mut(&session_id) else {
