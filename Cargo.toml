@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Lightweight UDP relay server for NAT traversal fallback"
 license = "MIT"
+authors = ["Hebbian Robotics"]
+repository = "https://github.com/Hebbian-Robotics/quic-relay"
 
 [[bin]]
 name = "quic-relay"
