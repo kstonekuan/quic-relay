@@ -62,7 +62,7 @@ nohup ~/quic-relay --port 4433 > ~/quic-relay.log 2>&1 &
 
 ### Prerequisites
 
-The relay requires a patched version of [quic-portal](https://github.com/kstonekuan/quic-portal) that adds `SO_REUSEPORT` to Quinn's sockets, allowing the keepalive socket and Quinn to coexist on the same port.
+The relay requires a patched version of [quic-portal](https://github.com/Hebbian-Robotics/quic-portal) that adds `SO_REUSEPORT` to Quinn's sockets, allowing the keepalive socket and Quinn to coexist on the same port.
 
 ### Configuration
 
